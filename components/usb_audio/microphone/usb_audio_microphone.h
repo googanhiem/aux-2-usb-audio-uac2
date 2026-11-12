@@ -5,6 +5,7 @@
 #ifdef USE_USB_AUDIO
 
 #include "esphome/components/usb_audio/usb_audio.h"
+#include "esphome/components/usb_audio/level_meter.h"
 
 #include "esphome/components/audio/audio.h"
 #include "esphome/components/microphone/microphone.h"
@@ -37,6 +38,9 @@ class USBAudioMicrophone : public microphone::Microphone,
 
   audio::AudioStreamInfo get_usb_stream_info() override { return this->audio_stream_info_; }
   void on_stream_state(StreamEvent event) override;
+
+  /// RMS and peak (dBFS) of the audio captured since the last call; false when nothing was captured.
+  bool take_level(float &rms_dbfs, float &peak_dbfs) { return this->level_meter_.take(rms_dbfs, peak_dbfs); }
   bool stream_idle() const override { return this->task_idle_; }
 
  protected:
@@ -60,6 +64,7 @@ class USBAudioMicrophone : public microphone::Microphone,
 
   // Sized by codegen from READ_PERIOD_MS in microphone/__init__.py.
   std::span<uint8_t> frame_;
+  LevelMeter level_meter_;
   // Created once in setup() and parked between streams.
   StaticTask mic_task_;
   std::atomic<uint8_t> commands_{0};

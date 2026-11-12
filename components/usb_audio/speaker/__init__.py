@@ -1,7 +1,7 @@
 import esphome.codegen as cg
-from esphome.components import speaker
+from esphome.components import audio, speaker
 import esphome.config_validation as cv
-from esphome.const import CONF_BUFFER_SIZE, CONF_ID, CONF_SAMPLE_RATE
+from esphome.const import CONF_BUFFER_SIZE, CONF_ID, CONF_NUM_CHANNELS, CONF_SAMPLE_RATE
 from esphome.types import ConfigType
 
 from .. import (
@@ -10,7 +10,6 @@ from .. import (
     bytes_per_frame,
     final_validate_one_per_hub,
     request_speaker_fifo,
-    set_stream_limits,
     stream_info,
     stream_schema,
     usb_audio_ns,
@@ -22,6 +21,23 @@ CONF_WRITE_TIMEOUT = "write_timeout"
 
 # Keep in sync with the driver default of CONFIG_UAC_NUM_PACKETS_PER_URB / CONFIG_UAC2_NUM_PACKETS_PER_URB (both 3)
 PACKETS_PER_TRANSFER = 3
+
+
+def set_speaker_input_limits(config: ConfigType) -> ConfigType:
+    """Accept 16- to 32-bit input at the stream's rate and channel count; the speaker converts it to bits_per_sample.
+
+    So the speaker can sit behind a router or mixer whose format (e.g. 24-bit for an I2S DAC) differs from what the USB
+    device streams.
+    """
+    audio.set_stream_limits(
+        min_bits_per_sample=16,
+        max_bits_per_sample=32,
+        min_channels=config[CONF_NUM_CHANNELS],
+        max_channels=config[CONF_NUM_CHANNELS],
+        min_sample_rate=config[CONF_SAMPLE_RATE],
+        max_sample_rate=config[CONF_SAMPLE_RATE],
+    )(config)
+    return config
 
 
 def validate_buffer_size(config: ConfigType) -> ConfigType:
@@ -40,7 +56,7 @@ CONFIG_SCHEMA = cv.All(
             ): cv.positive_time_period_milliseconds,
         }
     ),
-    set_stream_limits,
+    set_speaker_input_limits,
     validate_buffer_size,
     request_speaker_fifo,
 )

@@ -146,6 +146,9 @@ async def to_code(config: ConfigType) -> None:
         # Same 18 ms in flight as the UAC1 path. The UAC2 driver keeps these URBs submitted (filling them with
         # silence when the ring buffer is empty), so this is also the fixed playback latency it adds.
         esp32.set_idf_sdkconfig_default("CONFIG_UAC2_NUM_ISOC_URBS", 6)
+        # Playback and capture at once (speaker + microphone). usb_host splits the USB FIFO between the periodic OUT
+        # and IN packets the two platforms request, which is what the driver needs for duplex on the ESP32-S3.
+        esp32.set_idf_sdkconfig_default("CONFIG_UAC2_ALLOW_DUPLEX", True)
         cg.add_define("USE_USB_AUDIO_UAC2")
     else:
         # Keep in sync with esphome/idf_component.yml. usb_host adds espressif/usb on IDF 6.0 and later.

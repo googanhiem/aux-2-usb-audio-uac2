@@ -24,7 +24,7 @@
      }
  ).extend(cv.COMPONENT_SCHEMA)
  
-@@ -129,11 +140,19 @@
+@@ -129,11 +140,22 @@
  
  
  async def to_code(config: ConfigType) -> None:
@@ -39,6 +39,9 @@
 +        # Same 18 ms in flight as the UAC1 path. The UAC2 driver keeps these URBs submitted (filling them with
 +        # silence when the ring buffer is empty), so this is also the fixed playback latency it adds.
 +        esp32.set_idf_sdkconfig_default("CONFIG_UAC2_NUM_ISOC_URBS", 6)
++        # Playback and capture at once (speaker + microphone). usb_host splits the USB FIFO between the periodic OUT
++        # and IN packets the two platforms request, which is what the driver needs for duplex on the ESP32-S3.
++        esp32.set_idf_sdkconfig_default("CONFIG_UAC2_ALLOW_DUPLEX", True)
 +        cg.add_define("USE_USB_AUDIO_UAC2")
 +    else:
 +        # Keep in sync with esphome/idf_component.yml. usb_host adds espressif/usb on IDF 6.0 and later.
@@ -51,7 +54,15 @@
      await cg.register_component(var, config)
 --- a/esphome/components/usb_audio/usb_audio.h
 +++ b/esphome/components/usb_audio/usb_audio.h
-@@ -15,11 +15,22 @@
+@@ -6,6 +6,7 @@
+ 
+ #include <array>
+ #include <atomic>
++#include <string>
+ 
+ #include "esphome/components/audio/audio.h"
+ #include "esphome/core/component.h"
+@@ -15,11 +16,22 @@
  #include "freertos/FreeRTOS.h"
  #include "freertos/queue.h"
  #include "freertos/task.h"
@@ -74,7 +85,7 @@
  enum class Endpoint : uint8_t {
    SPEAKER,
    MICROPHONE,
-@@ -65,9 +76,11 @@
+@@ -65,9 +77,11 @@
      STARTED,
      RESUMED,
      CLOSED,
@@ -87,7 +98,20 @@
    uint8_t addr{0};
    uint8_t iface_num{0};
    // RESUMED: the request it answers; only the latest request's result is acted on.
-@@ -104,6 +117,11 @@
+@@ -96,6 +110,12 @@
+   void resume(Endpoint endpoint);
+   void suspend(Endpoint endpoint);
+ 
++  /// A device interface for the endpoint is open (the device is plugged in and was accepted).
++  bool is_connected(Endpoint endpoint) const { return this->endpoint_(endpoint).handle.load() != nullptr; }
++  /// One line about the endpoint's device and stream, for a text sensor: the device name, the format it streams, or
++  /// why it could not start. Safe from any task.
++  std::string get_status(Endpoint endpoint);
++
+   /// Safe from any task; the worker sends the values to the device.
+   void set_speaker_volume_level(float volume);
+   void set_speaker_mute_state(bool mute_state);
+@@ -104,6 +124,11 @@
    // and return ESP_ERR_TIMEOUT if it is still busy, instead of blocking on the driver's interface lock for seconds.
    esp_err_t read_microphone(uint8_t *buffer, size_t size, size_t *bytes_read, uint32_t timeout_ms);
    esp_err_t write_speaker(const uint8_t *data, size_t length, uint32_t timeout_ms);
@@ -99,7 +123,7 @@
  
   protected:
    static constexpr size_t EVENT_QUEUE_LENGTH = 16;
-@@ -113,9 +131,9 @@
+@@ -113,9 +138,9 @@
  
    struct EndpointState {
      // Read by the platform tasks and the worker; cleared first when the device goes away.
@@ -111,7 +135,7 @@
      USBAudioStream *platform{nullptr};
      uint8_t iface{0};
      bool stream_started{false};
-@@ -158,9 +176,11 @@
+@@ -158,9 +183,11 @@
        SUSPEND,
        CLOSE,
        CONTROLS,
@@ -124,7 +148,7 @@
      uint8_t addr{0};
      uint8_t iface_num{0};
      // RESUME: copied to the result, see EndpointState::request_seq.
-@@ -182,7 +202,7 @@
+@@ -182,7 +209,7 @@
    void on_closed_(const USBAudioEvent &event, uint32_t now);
    void start_stream_(Endpoint endpoint);
    void stream_failed_(Endpoint endpoint);
@@ -133,7 +157,7 @@
    void begin_close_(Endpoint endpoint);
    bool finish_closes_(uint32_t now);
    bool queue_op_(const Op &op);
-@@ -198,14 +218,27 @@
+@@ -198,15 +225,39 @@
    /// driver user; timeout_ms is reduced by the wait. Returns false when the worker still holds it.
    bool enter_driver_(uint32_t &timeout_ms);
    void unlock_driver_();
@@ -162,9 +186,21 @@
 +  static void device_event_stub(DeviceHandle handle, uac_host_device_event_t event, void *user_data);
 +#endif
  
++  /// Worker and main loop: replace the endpoint's status line.
++  void set_status_(Endpoint endpoint, const char *format, ...) __attribute__((format(printf, 3, 4)));
++  /// Worker: the device's product name for status lines ("USB audio" when unknown).
++  void read_product_name_(DeviceHandle handle);
++
++  static constexpr size_t STATUS_LENGTH = 112;
++  portMUX_TYPE status_lock_ = portMUX_INITIALIZER_UNLOCKED;
++  std::array<std::array<char, STATUS_LENGTH>, 2> status_{};
++  // Worker only.
++  char product_[48]{"USB audio"};
++
    StaticTask worker_;
    // Filled from the USB driver task and the worker, drained on the main loop.
-@@ -215,7 +248,7 @@
+   QueueHandle_t event_queue_{nullptr};
+@@ -215,7 +266,7 @@
    std::array<EndpointState, 2> endpoints_{};
    // Disconnects for devices whose open is still running on the worker, one per endpoint since a speakerphone opens
    // two interfaces; each is closed once its OPENED arrives.
@@ -175,7 +211,16 @@
    StaticQueue_t event_queue_struct_{};
 --- a/esphome/components/usb_audio/usb_audio.cpp
 +++ b/esphome/components/usb_audio/usb_audio.cpp
-@@ -32,10 +32,17 @@
+@@ -5,6 +5,8 @@
+ #include <algorithm>
+ #include <cinttypes>
+ #include <cmath>
++#include <cstdarg>
++#include <cstdio>
+ 
+ #include "esphome/core/application.h"
+ #include "esphome/core/hal.h"
+@@ -32,10 +34,17 @@
  static constexpr uint8_t MAX_CLOSE_ATTEMPTS = 5;
  static constexpr uint32_t CLOSE_RETRY_MS = 500;
  
@@ -193,15 +238,50 @@
  static uint8_t discrete_rate_count(const uac_host_dev_alt_param_t &alt) {
    return std::min<uint8_t>(alt.sample_freq_type, UAC_FREQ_NUM_MAX);
  }
-@@ -47,6 +54,7 @@
+@@ -47,14 +56,55 @@
    const uint8_t count = discrete_rate_count(alt);
    return std::find(alt.sample_freq, alt.sample_freq + count, sample_rate) != alt.sample_freq + count;
  }
 +#endif
  
++void USBAudioComponent::set_status_(Endpoint endpoint, const char *format, ...) {
++  char line[STATUS_LENGTH];
++  va_list args;
++  va_start(args, format);
++  vsnprintf(line, sizeof(line), format, args);
++  va_end(args);
++  portENTER_CRITICAL(&this->status_lock_);
++  std::copy(std::begin(line), std::end(line), this->status_[static_cast<size_t>(endpoint)].begin());
++  portEXIT_CRITICAL(&this->status_lock_);
++}
++
++std::string USBAudioComponent::get_status(Endpoint endpoint) {
++  std::array<char, STATUS_LENGTH> line;
++  portENTER_CRITICAL(&this->status_lock_);
++  line = this->status_[static_cast<size_t>(endpoint)];
++  portEXIT_CRITICAL(&this->status_lock_);
++  line.back() = '\0';
++  return std::string(line.data());
++}
++
++void USBAudioComponent::read_product_name_(DeviceHandle handle) {
++#ifdef USE_USB_AUDIO_UAC2
++  // Large (descriptor topology and strings), and the worker is the only caller.
++  static uac2_device_info_t info;
++  info = {};
++  if (uac2_host_device_get_info(handle, &info) == ESP_OK && info.product[0] != '\0') {
++    snprintf(this->product_, sizeof(this->product_), "%.47s", info.product);
++    return;
++  }
++#endif
++  snprintf(this->product_, sizeof(this->product_), "USB audio");
++}
++
  void USBAudioComponent::setup() {
++  this->set_status_(Endpoint::SPEAKER, "No device");
++  this->set_status_(Endpoint::MICROPHONE, "No device");
    this->event_queue_ = xQueueCreateStatic(EVENT_QUEUE_LENGTH, sizeof(USBAudioEvent), this->event_queue_storage_.data(),
-@@ -54,7 +62,12 @@
+                                           &this->event_queue_struct_);
    this->op_queue_ =
        xQueueCreateStatic(OP_QUEUE_LENGTH, sizeof(Op), this->op_queue_storage_.data(), &this->op_queue_struct_);
  
@@ -214,7 +294,7 @@
        .create_background_task = true,
        .task_priority = UAC_TASK_PRIORITY,
        .stack_size = UAC_TASK_STACK_SIZE,
-@@ -63,9 +76,13 @@
+@@ -63,9 +113,13 @@
        .callback_arg = this,
    };
  
@@ -229,7 +309,7 @@
      this->mark_failed();
      return;
    }
-@@ -113,10 +130,11 @@
+@@ -113,10 +167,11 @@
    const auto &microphone = this->endpoint_(Endpoint::MICROPHONE);
    ESP_LOGCONFIG(TAG,
                  "USB Audio:\n"
@@ -242,7 +322,7 @@
                  YESNO(speaker.platform != nullptr), YESNO(microphone.platform != nullptr));
  }
  
-@@ -140,7 +158,11 @@
+@@ -140,7 +195,11 @@
    xQueueReset(this->event_queue_);
  
    if (this->uac_installed_) {
@@ -254,7 +334,7 @@
      if (err == ESP_ERR_INVALID_STATE) {
        return false;
      }
-@@ -156,7 +178,7 @@
+@@ -156,7 +215,7 @@
    auto &ep = this->endpoint_(endpoint);
    ep.active = true;
    ep.request_seq++;
@@ -263,7 +343,7 @@
    if (handle == nullptr) {
      if (ep.open_failed && !ep.open_pending) {
        // The device is still plugged in but its last open failed; try again for this start.
-@@ -196,7 +218,7 @@
+@@ -196,7 +255,7 @@
    auto &ep = this->endpoint_(endpoint);
    ep.active = false;
    ep.request_seq++;
@@ -272,7 +352,7 @@
    // A start still running on the worker is suspended once its STARTED arrives.
    if (!ep.stream_started || handle == nullptr) {
      return;
-@@ -232,7 +254,7 @@
+@@ -232,7 +291,7 @@
    if (!this->enter_driver_(timeout_ms)) {
      return ESP_ERR_TIMEOUT;
    }
@@ -281,7 +361,7 @@
    if (handle == nullptr) {
      this->driver_users_.fetch_sub(1);
      return ESP_ERR_INVALID_STATE;
-@@ -240,7 +262,11 @@
+@@ -240,7 +299,11 @@
    // The driver collects up to `size` bytes for the whole timeout and returns what it got, or ESP_ERR_TIMEOUT when
    // nothing arrived.
    uint32_t actual = 0;
@@ -293,7 +373,7 @@
    this->driver_users_.fetch_sub(1);
    *bytes_read = actual;
    return err;
-@@ -251,13 +277,18 @@
+@@ -251,13 +314,18 @@
      // A non-blocking caller retries later.
      return ESP_ERR_TIMEOUT;
    }
@@ -313,7 +393,7 @@
    this->driver_users_.fetch_sub(1);
    if (err == ESP_FAIL || err == ESP_ERR_INVALID_STATE) {
      // Ring buffer full or stream inactive; report as timeout so callers back off and retry.
-@@ -266,6 +297,24 @@
+@@ -266,6 +334,24 @@
    return err;
  }
  
@@ -338,19 +418,19 @@
  void USBAudioComponent::process_event_(const USBAudioEvent &event, uint32_t now) {
    switch (event.type) {
      case USBAudioEvent::Type::CONNECTED: {
-@@ -296,6 +345,11 @@
+@@ -295,6 +381,11 @@
+       break;
      case USBAudioEvent::Type::CLOSED:
        this->on_closed_(event, now);
-       break;
++      break;
 +    case USBAudioEvent::Type::STREAM_DEAD:
 +#ifdef USE_USB_AUDIO_UAC2
 +      this->on_stream_dead_(event);
 +#endif
-+      break;
+       break;
    }
  }
- 
-@@ -438,7 +492,27 @@
+@@ -438,7 +529,27 @@
      return;
    }
    ep.platform->on_stream_state(StreamEvent::RUNNING);
@@ -378,7 +458,7 @@
  
  void USBAudioComponent::stream_failed_(Endpoint endpoint) {
    auto &ep = this->endpoint_(endpoint);
-@@ -475,7 +549,7 @@
+@@ -475,7 +586,7 @@
    }
  }
  
@@ -387,7 +467,7 @@
    for (size_t i = 0; i < this->endpoints_.size(); i++) {
      auto &ep = this->endpoints_[i];
      if (handle != nullptr && ep.handle.load() == handle) {
-@@ -504,7 +578,7 @@
+@@ -504,7 +615,7 @@
  void USBAudioComponent::begin_close_(Endpoint endpoint) {
    auto &ep = this->endpoint_(endpoint);
    // Platform reads and writes see nullptr from here on and return at once.
@@ -396,7 +476,15 @@
    if (handle == nullptr) {
      return;
    }
-@@ -619,7 +693,16 @@
+@@ -554,6 +665,7 @@
+   }
+   ep.close_attempts = 0;
+   ep.closing = nullptr;
++  this->set_status_(event.endpoint, "No device");
+   ep.stream_started = false;
+   ep.start_rejected = false;
+   ep.start_pending = false;
+@@ -619,7 +731,16 @@
          threshold = buffer_size;
          buffer_size += SPEAKER_RING_SLACK;
        }
@@ -413,7 +501,7 @@
            .addr = op.addr,
            .iface_num = op.iface_num,
            .buffer_size = buffer_size,
-@@ -627,11 +710,21 @@
+@@ -627,10 +748,22 @@
            .callback = &USBAudioComponent::device_event_stub,
            .callback_arg = this,
        };
@@ -426,17 +514,18 @@
 +#endif
        if (err != ESP_OK) {
          ESP_LOGE(TAG, "Failed to open %s interface: %s", LOG_STR_ARG(name), esp_err_to_name(err));
-       }
++        this->set_status_(op.endpoint, "Device found, open failed (%s)", esp_err_to_name(err));
++      } else {
++        this->read_product_name_(handle);
++        this->set_status_(op.endpoint, "%s: connected", this->product_);
 +#ifdef USE_USB_AUDIO_UAC2
-+      else {
 +        // Topology, clock, feature unit and alternate settings, for bring-up of new devices.
 +        uac2_host_device_print_info(handle);
-+      }
 +#endif
+       }
        result.type = USBAudioEvent::Type::OPENED;
        result.ok = err == ESP_OK;
-       result.handle = handle;
-@@ -642,6 +735,15 @@
+@@ -642,6 +775,15 @@
      }
      case Op::Type::START: {
        result.type = USBAudioEvent::Type::STARTED;
@@ -452,9 +541,17 @@
        uac_host_stream_config_t stm_cfg{};
        if (this->populate_stream_config_(op.endpoint, op.handle, stm_cfg, result.rejected)) {
          esp_err_t err = uac_host_device_start(op.handle, &stm_cfg);
-@@ -653,11 +755,16 @@
+@@ -651,13 +793,24 @@
+         result.rejected = err == ESP_ERR_NOT_SUPPORTED;
+         if (!result.ok) {
            ESP_LOGW(TAG, "Failed to start %s stream: %s", LOG_STR_ARG(name), esp_err_to_name(err));
++          this->set_status_(op.endpoint, "%s: start failed (%s)", this->product_, esp_err_to_name(err));
++        } else {
++          this->set_status_(op.endpoint, "%s: %" PRIu32 " Hz, %u-bit, %u ch", this->product_, stm_cfg.sample_freq,
++                            stm_cfg.bit_resolution, stm_cfg.channels);
          }
++      } else if (result.rejected) {
++        this->set_status_(op.endpoint, "%s: format not supported (see log)", this->product_);
        }
 +#endif
        this->post_event_(result);
@@ -469,7 +566,7 @@
        result.type = USBAudioEvent::Type::RESUMED;
        result.seq = op.seq;
        // Already started or active is ESP_OK; ESP_ERR_INVALID_STATE means the interface is not ready.
-@@ -669,7 +776,11 @@
+@@ -669,7 +822,11 @@
        return;
      }
      case Op::Type::SUSPEND: {
@@ -481,7 +578,7 @@
        if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) {
          ESP_LOGW(TAG, "Failed to suspend %s stream: %s", LOG_STR_ARG(name), esp_err_to_name(err));
        }
-@@ -677,17 +788,25 @@
+@@ -677,17 +834,25 @@
      }
      case Op::Type::CLOSE: {
        if (op.stop) {
@@ -508,7 +605,7 @@
          this->post_event_(result);
          return;
        }
-@@ -713,10 +832,93 @@
+@@ -713,10 +878,123 @@
        }
        return;
      }
@@ -548,9 +645,35 @@
 +    ESP_LOGW(TAG, "%s does not support requested format (channels=%u bits=%u sample_rate=%" PRIu32 " Hz)",
 +             LOG_STR_ARG(name), channels, bits, sample_rate);
 +    this->log_uac2_alts_(endpoint, handle);
++    // A full-speed host sends one packet per 1 ms frame. Some high-speed devices keep their 125 us microframe packet
++    // sizes at full speed, so their endpoints are too small for the format (e.g. 64 bytes where 48 kHz stereo needs
++    // 192): say so, since it cannot be fixed on the host.
++    const uint32_t needed = (sample_rate + 999) / 1000 * channels * (bits / 8);
++    uint16_t largest = 0;
++    for (uint8_t alt = 1; alt < 16; alt++) {
++      uac2_host_dev_alt_param_t param{};
++      if (uac2_host_get_device_alt_param(handle, alt, &param) != ESP_OK) {
++        break;
++      }
++      if (param.channels == channels && param.bit_resolution == bits) {
++        largest = std::max(largest, param.ep_max_packet_size);
++      }
++    }
++    if (err == ESP_ERR_INVALID_SIZE && largest != 0 && largest < needed) {
++      ESP_LOGE(TAG,
++               "%s: %" PRIu32 " Hz %u-bit %u ch needs %" PRIu32 "-byte packets every 1 ms, but the device allows %u "
++               "bytes. It likely sizes its endpoints for high-speed USB only; the ESP32-S3 host is full-speed.",
++               this->product_, sample_rate, bits, channels, needed, largest);
++      this->set_status_(endpoint, "%s: endpoint too small at full speed (%u of %" PRIu32 " B)", this->product_,
++                        largest, needed);
++    } else {
++      this->set_status_(endpoint, "%s: %" PRIu32 " Hz %u-bit %u ch not supported (%s)", this->product_, sample_rate,
++                        bits, channels, esp_err_to_name(err));
++    }
 +    return err;
 +  }
 +  if (err != ESP_OK) {
++    this->set_status_(endpoint, "%s: start failed (%s)", this->product_, esp_err_to_name(err));
 +    return err;
 +  }
 +
@@ -572,8 +695,12 @@
 +             LOG_STR_ARG(name), stream.alt_setting, stream.bit_resolution, stream.sub_slot_size);
 +    uac2_host_device_stop(handle);
 +    rejected = true;
++    this->set_status_(endpoint, "%s: %u-bit in %u-byte slots not supported", this->product_, stream.bit_resolution,
++                      stream.sub_slot_size);
 +    return ESP_ERR_NOT_SUPPORTED;
 +  }
++  this->set_status_(endpoint, "%s: %" PRIu32 " Hz, %u-bit, %u ch (alt %u, %s)", this->product_, stream.sample_freq,
++                    stream.bit_resolution, stream.channels, stream.alt_setting, SYNC_NAMES[stream.sync_type & 3]);
 +  return ESP_OK;
 +}
 +
@@ -603,7 +730,7 @@
                                                  uac_host_stream_config_t &stream_config, bool &rejected) {
    const LogString *name = endpoint_name(endpoint);
    const audio::AudioStreamInfo info = this->endpoint_(endpoint).platform->get_usb_stream_info();
-@@ -789,20 +991,58 @@
+@@ -789,20 +1067,58 @@
    }
    return false;
  }
@@ -663,7 +790,7 @@
    }
    return retry;
  }
-@@ -831,6 +1071,62 @@
+@@ -831,6 +1147,62 @@
    return true;
  }
  
@@ -726,7 +853,7 @@
  void USBAudioComponent::driver_event_stub(uint8_t addr, uint8_t iface_num, const uac_host_driver_event_t event,
                                            void *user_data) {
    auto *self = static_cast<USBAudioComponent *>(user_data);
-@@ -851,7 +1147,7 @@
+@@ -851,7 +1223,7 @@
    self->post_event_(evt);
  }
  
@@ -735,7 +862,7 @@
                                            void *user_data) {
    auto *self = static_cast<USBAudioComponent *>(user_data);
    if (event == UAC_HOST_DEVICE_EVENT_TX_DONE) {
-@@ -871,6 +1167,8 @@
+@@ -871,6 +1243,8 @@
    }
  }
  
@@ -744,9 +871,116 @@
  }  // namespace esphome::usb_audio
  
  #endif
+--- /dev/null
++++ b/esphome/components/usb_audio/level_meter.h
+@@ -0,0 +1,86 @@
++#pragma once
++
++#include <algorithm>
++#include <cmath>
++#include <cstddef>
++#include <cstdint>
++
++#include "freertos/FreeRTOS.h"
++
++namespace esphome::usb_audio {
++
++/// Peak and RMS of interleaved signed little-endian PCM (any channel count, 1-4 bytes per sample), collected on an
++/// audio task and read out, then reset, by a sensor on the main loop. Format-agnostic, so it works for any USB device.
++class LevelMeter {
++ public:
++  static constexpr float SILENCE_DBFS = -100.0f;
++
++  void add(const uint8_t *data, size_t length, uint8_t bytes_per_sample) {
++    if (bytes_per_sample == 0 || bytes_per_sample > 4) {
++      return;
++    }
++    const size_t samples = length / bytes_per_sample;
++    if (samples == 0) {
++      return;
++    }
++    const int shift = 32 - 8 * bytes_per_sample;
++    float sum_sq = 0.0f;
++    uint32_t peak = 0;
++    for (size_t i = 0; i < samples; i++) {
++      const uint8_t *p = data + i * bytes_per_sample;
++      uint32_t raw = 0;
++      for (uint8_t b = 0; b < bytes_per_sample; b++) {
++        raw |= static_cast<uint32_t>(p[b]) << (8 * b);
++      }
++      // Left-align to 32 bits, so the sign bit lands at bit 31 for every width.
++      const int32_t value = static_cast<int32_t>(raw << shift);
++      const uint32_t magnitude = value < 0 ? static_cast<uint32_t>(-(static_cast<int64_t>(value)))
++                                           : static_cast<uint32_t>(value);
++      if (magnitude > peak) {
++        peak = magnitude;
++      }
++      const float normalized = static_cast<float>(value) * (1.0f / 2147483648.0f);
++      sum_sq += normalized * normalized;
++    }
++    portENTER_CRITICAL(&this->lock_);
++    this->sum_sq_ += sum_sq;
++    this->count_ += samples;
++    if (peak > this->peak_) {
++      this->peak_ = peak;
++    }
++    portEXIT_CRITICAL(&this->lock_);
++  }
++
++  /// RMS and peak in dBFS since the last call; false when no audio arrived since then.
++  bool take(float &rms_dbfs, float &peak_dbfs) {
++    portENTER_CRITICAL(&this->lock_);
++    const float sum_sq = this->sum_sq_;
++    const uint32_t count = this->count_;
++    const uint32_t peak = this->peak_;
++    this->sum_sq_ = 0.0f;
++    this->count_ = 0;
++    this->peak_ = 0;
++    portEXIT_CRITICAL(&this->lock_);
++    if (count == 0) {
++      return false;
++    }
++    rms_dbfs = to_dbfs(std::sqrt(sum_sq / static_cast<float>(count)));
++    peak_dbfs = to_dbfs(static_cast<float>(peak) * (1.0f / 2147483648.0f));
++    return true;
++  }
++
++ protected:
++  static float to_dbfs(float amplitude) {
++    if (amplitude <= 0.00001f) {
++      return SILENCE_DBFS;
++    }
++    return std::max(SILENCE_DBFS, 20.0f * std::log10(amplitude));
++  }
++
++  portMUX_TYPE lock_ = portMUX_INITIALIZER_UNLOCKED;
++  float sum_sq_{0.0f};
++  uint32_t count_{0};
++  uint32_t peak_{0};
++};
++
++}  // namespace esphome::usb_audio
 --- a/esphome/components/usb_audio/speaker/__init__.py
 +++ b/esphome/components/usb_audio/speaker/__init__.py
-@@ -20,7 +20,7 @@
+@@ -1,7 +1,7 @@
+ import esphome.codegen as cg
+-from esphome.components import speaker
++from esphome.components import audio, speaker
+ import esphome.config_validation as cv
+-from esphome.const import CONF_BUFFER_SIZE, CONF_ID, CONF_SAMPLE_RATE
++from esphome.const import CONF_BUFFER_SIZE, CONF_ID, CONF_NUM_CHANNELS, CONF_SAMPLE_RATE
+ from esphome.types import ConfigType
+ 
+ from .. import (
+@@ -10,7 +10,6 @@
+     bytes_per_frame,
+     final_validate_one_per_hub,
+     request_speaker_fifo,
+-    set_stream_limits,
+     stream_info,
+     stream_schema,
+     usb_audio_ns,
+@@ -20,10 +19,27 @@
  
  CONF_WRITE_TIMEOUT = "write_timeout"
  
@@ -755,9 +989,67 @@
  PACKETS_PER_TRANSFER = 3
  
  
++def set_speaker_input_limits(config: ConfigType) -> ConfigType:
++    """Accept 16- to 32-bit input at the stream's rate and channel count; the speaker converts it to bits_per_sample.
++
++    So the speaker can sit behind a router or mixer whose format (e.g. 24-bit for an I2S DAC) differs from what the USB
++    device streams.
++    """
++    audio.set_stream_limits(
++        min_bits_per_sample=16,
++        max_bits_per_sample=32,
++        min_channels=config[CONF_NUM_CHANNELS],
++        max_channels=config[CONF_NUM_CHANNELS],
++        min_sample_rate=config[CONF_SAMPLE_RATE],
++        max_sample_rate=config[CONF_SAMPLE_RATE],
++    )(config)
++    return config
++
++
+ def validate_buffer_size(config: ConfigType) -> ConfigType:
+     """The driver only sends complete transfers, so the buffer must hold two of them to keep audio flowing."""
+     frames_per_packet = -(-config[CONF_SAMPLE_RATE] // 1000)
+@@ -40,7 +56,7 @@
+             ): cv.positive_time_period_milliseconds,
+         }
+     ),
+-    set_stream_limits,
++    set_speaker_input_limits,
+     validate_buffer_size,
+     request_speaker_fifo,
+ )
 --- a/esphome/components/usb_audio/speaker/usb_audio_speaker.h
 +++ b/esphome/components/usb_audio/speaker/usb_audio_speaker.h
-@@ -66,6 +66,10 @@
+@@ -5,6 +5,7 @@
+ #ifdef USE_USB_AUDIO
+ 
+ #include "esphome/components/usb_audio/usb_audio.h"
++#include "esphome/components/usb_audio/level_meter.h"
+ 
+ #include "esphome/components/audio/audio.h"
+ #include "esphome/components/speaker/speaker.h"
+@@ -46,6 +47,9 @@
+   bool stream_idle() const override { return this->writes_in_flight_ == 0; }
+   void on_transfer_taken() override;
+ 
++  /// RMS and peak (dBFS) of the audio played since the last call; false when nothing was played.
++  bool take_level(float &rms_dbfs, float &peak_dbfs) { return this->level_meter_.take(rms_dbfs, peak_dbfs); }
++
+  protected:
+   static constexpr uint8_t COMMAND_START = 1 << 0;
+   static constexpr uint8_t COMMAND_STOP = 1 << 1;
+@@ -54,7 +58,10 @@
+   void deliver_reports_();
+   void begin_finishing_();
+   void stop_();
++  /// Checks the caller's format and converts its sample width to the USB stream's when they differ.
+   size_t play_internal_(const uint8_t *data, size_t length, uint32_t budget_ms);
++  /// Writes audio already in the USB stream's format.
++  size_t play_usb_(const uint8_t *data, size_t length, uint32_t budget_ms);
+   /// Write silence until a whole USB transfer is padded, so the driver sends a final partial transfer.
+   void pad_with_silence_();
+   /// Write to the driver, counting the bytes in ring_bytes_ (and in ring_padding_ for silence padding).
+@@ -66,6 +73,10 @@
    uint32_t next_transfer_bytes_(uint32_t &accum) const;
    uint32_t audio_tail_bytes_();
    bool flush_tail_();
@@ -768,7 +1060,16 @@
  
    // The configured format the USB stream runs with. Callers such as the media pipeline set audio_stream_info_ for
    // each item, so play() checks it against this instead of reopening the stream with another format.
-@@ -110,6 +114,17 @@
+@@ -105,11 +116,26 @@
+   std::atomic<uint8_t> writes_in_flight_{0};
+   // Set by loop() while it pads a tail; play_internal_() waits instead of writing after the padding.
+   std::atomic<bool> flushing_{false};
++  LevelMeter level_meter_;
++  // Scratch space for converting the caller's sample width to the USB stream's; set in setup().
++  uint8_t *convert_buffer_{nullptr};
++  size_t convert_buffer_size_{0};
+   // Set while play() rejects audio in a format other than usb_stream_info_, so the error is logged once.
+   std::atomic<bool> format_mismatch_{false};
    bool finishing_{false};
    // finish() arrived while the stream was still starting.
    bool finish_after_start_{false};
@@ -788,7 +1089,15 @@
  }  // namespace esphome::usb_audio
 --- a/esphome/components/usb_audio/speaker/usb_audio_speaker.cpp
 +++ b/esphome/components/usb_audio/speaker/usb_audio_speaker.cpp
-@@ -19,6 +19,14 @@
+@@ -6,6 +6,7 @@
+ #include <cinttypes>
+ 
+ #include "esphome/core/hal.h"
++#include "esphome/core/helpers.h"
+ #include "esphome/core/log.h"
+ #include "esp_err.h"
+ #include "esp_timer.h"
+@@ -19,6 +20,14 @@
  // Zeros are silence for the signed PCM the driver streams; 240 is a whole number of frames for every format.
  static constexpr uint8_t SILENCE[240] = {};
  
@@ -803,7 +1112,7 @@
  void USBAudioSpeaker::setup() {
    const auto &info = this->usb_stream_info_;
    this->write_chunk_ = info.frames_to_bytes(std::max<uint32_t>(info.bytes_to_frames(this->buffer_size_ / 4), 1));
-@@ -26,9 +34,9 @@
+@@ -26,11 +35,18 @@
    this->frame_bytes_ = info.frames_to_bytes(1);
    this->packet_bytes_ = info.frames_to_bytes(info.get_sample_rate() / 1000);
    this->packet_frac_ = info.get_sample_rate() % 1000;
@@ -815,8 +1124,17 @@
 +  this->in_flight_us_ = ISOC_URBS * this->transfer_us_;
    // About 10 ms per report, like the I2S speaker's DMA buffers.
    this->report_frames_ = std::max<uint32_t>(info.get_sample_rate() / 100, 1);
++  // Up to one write chunk of USB audio per conversion pass.
++  this->convert_buffer_size_ = this->write_chunk_;
++  RAMAllocator<uint8_t> allocator;
++  this->convert_buffer_ = allocator.allocate(this->convert_buffer_size_);
++  if (this->convert_buffer_ == nullptr) {
++    this->convert_buffer_size_ = 0;
++  }
    // start(), stop() and finish() wake the loop.
-@@ -59,12 +67,18 @@
+   this->disable_loop();
+ }
+@@ -59,12 +75,18 @@
      this->ring_bytes_ = 0;
      this->ring_padding_ = 0;
      // Resuming resets the driver's accumulator, then prepares every transfer, which advances it by their packets.
@@ -836,7 +1154,7 @@
      portEXIT_CRITICAL(&this->taken_lock_);
      this->state_ = speaker::STATE_STARTING;
      // Answers through on_stream_state() now or once the device connects.
-@@ -79,6 +93,22 @@
+@@ -79,6 +101,22 @@
        this->finish_after_start_ = true;
      }
    }
@@ -859,7 +1177,7 @@
    if (this->finishing_ && this->pad_remaining_ > 0) {
      this->pad_with_silence_();
    }
-@@ -91,10 +121,40 @@
+@@ -91,10 +129,40 @@
    }
  }
  
@@ -901,7 +1219,7 @@
      accum += this->packet_frac_;
      size += this->packet_bytes_;
      if (accum >= 1000) {
-@@ -123,6 +183,10 @@
+@@ -123,6 +191,10 @@
  // reported; a caller that stops mid-transfer (the mixer at the end of a stream) would otherwise wait for them forever.
  // Returns true while a tail is still pending, so loop() keeps running.
  bool USBAudioSpeaker::flush_tail_() {
@@ -912,7 +1230,7 @@
    if (this->audio_tail_bytes_() == 0) {
      return false;
    }
-@@ -171,6 +235,10 @@
+@@ -171,6 +243,10 @@
      return;
    }
    this->finishing_ = true;
@@ -923,7 +1241,7 @@
    // finish() pads the last transfer itself, so a tail flush that was cut short hands over to it.
    this->flushing_ = false;
    this->pad_remaining_ = this->transfer_bytes_;
-@@ -194,6 +262,10 @@
+@@ -194,6 +270,10 @@
    if (event == StreamEvent::RUNNING) {
      if (this->state_ == speaker::STATE_STARTING) {
        this->state_ = speaker::STATE_RUNNING;
@@ -934,7 +1252,68 @@
        if (this->finish_after_start_) {
          this->finish_after_start_ = false;
          this->begin_finishing_();
-@@ -292,6 +364,17 @@
+@@ -217,11 +297,30 @@
+ // Callers such as voice_assistant and rtttl call this from loop(), so it never blocks.
+ size_t USBAudioSpeaker::play(const uint8_t *data, size_t length) { return this->play(data, length, 0); }
+ 
++// Convert interleaved signed little-endian samples from in_bytes to out_bytes wide, keeping the most significant bytes
++// (narrowing truncates, widening pads with zeros).
++static void convert_sample_width(const uint8_t *in, uint8_t *out, size_t samples, uint8_t in_bytes,
++                                 uint8_t out_bytes) {
++  for (size_t i = 0; i < samples; i++) {
++    const uint8_t *src = in + i * in_bytes;
++    uint8_t *dst = out + i * out_bytes;
++    for (uint8_t b = 0; b < out_bytes; b++) {
++      // Byte b of the output is byte (b + in_bytes - out_bytes) of the input, counting from the least significant.
++      const int src_index = static_cast<int>(b) + in_bytes - out_bytes;
++      dst[b] = src_index >= 0 ? src[src_index] : 0;
++    }
++  }
++}
++
+ size_t USBAudioSpeaker::play_internal_(const uint8_t *data, size_t length, uint32_t budget_ms) {
+-  if (this->audio_stream_info_ != this->usb_stream_info_) {
++  const auto &info = this->audio_stream_info_;
++  const auto &usb = this->usb_stream_info_;
++  const uint8_t in_bytes = info.get_bits_per_sample() / 8;
++  const uint8_t out_bytes = usb.get_bits_per_sample() / 8;
++  if (info.get_sample_rate() != usb.get_sample_rate() || info.get_channels() != usb.get_channels() || in_bytes == 0 ||
++      in_bytes > 4 || (in_bytes != out_bytes && this->convert_buffer_ == nullptr)) {
+     // Playing it through the configured stream would change the speed and channel layout.
+     if (!this->format_mismatch_.exchange(true)) {
+-      const auto &info = this->audio_stream_info_;
+       ESP_LOGE(TAG,
+                "Audio format (%" PRIu32 " Hz, %u bits, %u channels) does not match the USB stream; use a resampler "
+                "speaker",
+@@ -233,7 +332,27 @@
+     return 0;
+   }
+   this->format_mismatch_ = false;
++
++  if (in_bytes == out_bytes) {
++    const size_t written = this->play_usb_(data, length, budget_ms);
++    this->level_meter_.add(data, written, in_bytes);
++    return written;
++  }
++  // Convert up to one scratch buffer of whole frames; the caller sends the rest on its next call.
++  const size_t channels = info.get_channels();
++  const size_t frames = std::min(length / (in_bytes * channels), this->convert_buffer_size_ / (out_bytes * channels));
++  if (frames == 0) {
++    return 0;
++  }
++  convert_sample_width(data, this->convert_buffer_, frames * channels, in_bytes, out_bytes);
++  const size_t written = this->play_usb_(this->convert_buffer_, frames * channels * out_bytes, budget_ms);
++  const size_t consumed = written / out_bytes * in_bytes;
++  this->level_meter_.add(data, consumed, in_bytes);
++  return consumed;
++}
+ 
++size_t USBAudioSpeaker::play_usb_(const uint8_t *data, size_t length, uint32_t budget_ms) {
++
+   if (this->state_ != speaker::STATE_RUNNING) {
+     this->start();
+     // Wait out the budget so a pipeline task retrying play() does not spin.
+@@ -292,6 +411,17 @@
  }
  
  size_t USBAudioSpeaker::ring_room_() const {
@@ -952,7 +1331,7 @@
    // Whole frames up to buffer_size_. ring_bytes_ is never below the real fill, so a write of this much does not wait.
    const uint32_t ring = this->ring_bytes_;
    const uint32_t room = ring < this->buffer_size_ ? this->buffer_size_ - ring : 0;
-@@ -299,6 +382,15 @@
+@@ -299,6 +429,15 @@
  }
  
  esp_err_t USBAudioSpeaker::write_(const uint8_t *data, size_t length, uint32_t timeout_ms, bool padding) {
@@ -968,7 +1347,7 @@
    // Counted first: the driver submits transfers inside the write, and on_transfer_taken() must see these bytes then.
    // A failed write stores nothing, since the driver only writes whole chunks.
    this->ring_bytes_.fetch_add(length);
-@@ -335,9 +427,14 @@
+@@ -335,9 +474,14 @@
  }
  
  void USBAudioSpeaker::on_transfer_taken() {
@@ -984,7 +1363,7 @@
    // the ring buffer holds all of it; otherwise it parks the transfer until the next write.
    uint32_t accum = this->packet_frac_accum_;
    const uint32_t size = this->next_transfer_bytes_(accum);
-@@ -404,6 +501,12 @@
+@@ -404,6 +548,12 @@
  }
  
  bool USBAudioSpeaker::has_buffered_data_() const {
@@ -997,3 +1376,41 @@
    // The driver still holds a whole transfer to take, or one it took has not finished playing. Less than a transfer
    // stays in the ring buffer until the next write.
    return this->state_ == speaker::STATE_RUNNING &&
+--- a/esphome/components/usb_audio/microphone/usb_audio_microphone.h
++++ b/esphome/components/usb_audio/microphone/usb_audio_microphone.h
+@@ -5,6 +5,7 @@
+ #ifdef USE_USB_AUDIO
+ 
+ #include "esphome/components/usb_audio/usb_audio.h"
++#include "esphome/components/usb_audio/level_meter.h"
+ 
+ #include "esphome/components/audio/audio.h"
+ #include "esphome/components/microphone/microphone.h"
+@@ -37,6 +38,9 @@
+ 
+   audio::AudioStreamInfo get_usb_stream_info() override { return this->audio_stream_info_; }
+   void on_stream_state(StreamEvent event) override;
++
++  /// RMS and peak (dBFS) of the audio captured since the last call; false when nothing was captured.
++  bool take_level(float &rms_dbfs, float &peak_dbfs) { return this->level_meter_.take(rms_dbfs, peak_dbfs); }
+   bool stream_idle() const override { return this->task_idle_; }
+ 
+  protected:
+@@ -60,6 +64,7 @@
+ 
+   // Sized by codegen from READ_PERIOD_MS in microphone/__init__.py.
+   std::span<uint8_t> frame_;
++  LevelMeter level_meter_;
+   // Created once in setup() and parked between streams.
+   StaticTask mic_task_;
+   std::atomic<uint8_t> commands_{0};
+--- a/esphome/components/usb_audio/microphone/usb_audio_microphone.cpp
++++ b/esphome/components/usb_audio/microphone/usb_audio_microphone.cpp
+@@ -158,6 +158,7 @@
+       }
+ 
+       if (err == ESP_OK && bytes_read > 0) {
++        this->level_meter_.add(this->frame_.data(), bytes_read, this->audio_stream_info_.get_bits_per_sample() / 8);
+         this->publish_audio_(this->frame_.first(bytes_read), this->audio_stream_info_);
+       } else if (err == ESP_ERR_TIMEOUT) {
+         // The driver already waited READ_TIMEOUT_MS for data; read again.

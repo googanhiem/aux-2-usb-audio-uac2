@@ -10,6 +10,13 @@ esp32_ble_tracker: !remove
 switch:
   - id: !remove bluetooth_switch
 
+##### Replaced in usb-audio.yaml: the output router and selector gain a USB output
+speaker:
+  - id: !remove audio_router_speaker
+
+select:
+  - id: !remove audio_output_selector
+
 api:
   # The wizard's first page is the (removed) Bluetooth switch; drop the wizard for this test build.
   wizard: !remove

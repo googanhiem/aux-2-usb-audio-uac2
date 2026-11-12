@@ -6,6 +6,7 @@
 #include <cinttypes>
 
 #include "esphome/core/hal.h"
+#include "esphome/core/helpers.h"
 #include "esphome/core/log.h"
 #include "esp_err.h"
 #include "esp_timer.h"
@@ -39,6 +40,13 @@ void USBAudioSpeaker::setup() {
   this->in_flight_us_ = ISOC_URBS * this->transfer_us_;
   // About 10 ms per report, like the I2S speaker's DMA buffers.
   this->report_frames_ = std::max<uint32_t>(info.get_sample_rate() / 100, 1);
+  // Up to one write chunk of USB audio per conversion pass.
+  this->convert_buffer_size_ = this->write_chunk_;
+  RAMAllocator<uint8_t> allocator;
+  this->convert_buffer_ = allocator.allocate(this->convert_buffer_size_);
+  if (this->convert_buffer_ == nullptr) {
+    this->convert_buffer_size_ = 0;
+  }
   // start(), stop() and finish() wake the loop.
   this->disable_loop();
 }
@@ -289,11 +297,30 @@ size_t USBAudioSpeaker::play(const uint8_t *data, size_t length, TickType_t tick
 // Callers such as voice_assistant and rtttl call this from loop(), so it never blocks.
 size_t USBAudioSpeaker::play(const uint8_t *data, size_t length) { return this->play(data, length, 0); }
 
+// Convert interleaved signed little-endian samples from in_bytes to out_bytes wide, keeping the most significant bytes
+// (narrowing truncates, widening pads with zeros).
+static void convert_sample_width(const uint8_t *in, uint8_t *out, size_t samples, uint8_t in_bytes,
+                                 uint8_t out_bytes) {
+  for (size_t i = 0; i < samples; i++) {
+    const uint8_t *src = in + i * in_bytes;
+    uint8_t *dst = out + i * out_bytes;
+    for (uint8_t b = 0; b < out_bytes; b++) {
+      // Byte b of the output is byte (b + in_bytes - out_bytes) of the input, counting from the least significant.
+      const int src_index = static_cast<int>(b) + in_bytes - out_bytes;
+      dst[b] = src_index >= 0 ? src[src_index] : 0;
+    }
+  }
+}
+
 size_t USBAudioSpeaker::play_internal_(const uint8_t *data, size_t length, uint32_t budget_ms) {
-  if (this->audio_stream_info_ != this->usb_stream_info_) {
+  const auto &info = this->audio_stream_info_;
+  const auto &usb = this->usb_stream_info_;
+  const uint8_t in_bytes = info.get_bits_per_sample() / 8;
+  const uint8_t out_bytes = usb.get_bits_per_sample() / 8;
+  if (info.get_sample_rate() != usb.get_sample_rate() || info.get_channels() != usb.get_channels() || in_bytes == 0 ||
+      in_bytes > 4 || (in_bytes != out_bytes && this->convert_buffer_ == nullptr)) {
     // Playing it through the configured stream would change the speed and channel layout.
     if (!this->format_mismatch_.exchange(true)) {
-      const auto &info = this->audio_stream_info_;
       ESP_LOGE(TAG,
                "Audio format (%" PRIu32 " Hz, %u bits, %u channels) does not match the USB stream; use a resampler "
                "speaker",
@@ -305,6 +332,26 @@ size_t USBAudioSpeaker::play_internal_(const uint8_t *data, size_t length, uint3
     return 0;
   }
   this->format_mismatch_ = false;
+
+  if (in_bytes == out_bytes) {
+    const size_t written = this->play_usb_(data, length, budget_ms);
+    this->level_meter_.add(data, written, in_bytes);
+    return written;
+  }
+  // Convert up to one scratch buffer of whole frames; the caller sends the rest on its next call.
+  const size_t channels = info.get_channels();
+  const size_t frames = std::min(length / (in_bytes * channels), this->convert_buffer_size_ / (out_bytes * channels));
+  if (frames == 0) {
+    return 0;
+  }
+  convert_sample_width(data, this->convert_buffer_, frames * channels, in_bytes, out_bytes);
+  const size_t written = this->play_usb_(this->convert_buffer_, frames * channels * out_bytes, budget_ms);
+  const size_t consumed = written / out_bytes * in_bytes;
+  this->level_meter_.add(data, consumed, in_bytes);
+  return consumed;
+}
+
+size_t USBAudioSpeaker::play_usb_(const uint8_t *data, size_t length, uint32_t budget_ms) {
 
   if (this->state_ != speaker::STATE_RUNNING) {
     this->start();

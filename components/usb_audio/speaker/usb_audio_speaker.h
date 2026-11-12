@@ -5,6 +5,7 @@
 #ifdef USE_USB_AUDIO
 
 #include "esphome/components/usb_audio/usb_audio.h"
+#include "esphome/components/usb_audio/level_meter.h"
 
 #include "esphome/components/audio/audio.h"
 #include "esphome/components/speaker/speaker.h"
@@ -46,6 +47,9 @@ class USBAudioSpeaker : public speaker::Speaker,
   bool stream_idle() const override { return this->writes_in_flight_ == 0; }
   void on_transfer_taken() override;
 
+  /// RMS and peak (dBFS) of the audio played since the last call; false when nothing was played.
+  bool take_level(float &rms_dbfs, float &peak_dbfs) { return this->level_meter_.take(rms_dbfs, peak_dbfs); }
+
  protected:
   static constexpr uint8_t COMMAND_START = 1 << 0;
   static constexpr uint8_t COMMAND_STOP = 1 << 1;
@@ -54,7 +58,10 @@ class USBAudioSpeaker : public speaker::Speaker,
   void deliver_reports_();
   void begin_finishing_();
   void stop_();
+  /// Checks the caller's format and converts its sample width to the USB stream's when they differ.
   size_t play_internal_(const uint8_t *data, size_t length, uint32_t budget_ms);
+  /// Writes audio already in the USB stream's format.
+  size_t play_usb_(const uint8_t *data, size_t length, uint32_t budget_ms);
   /// Write silence until a whole USB transfer is padded, so the driver sends a final partial transfer.
   void pad_with_silence_();
   /// Write to the driver, counting the bytes in ring_bytes_ (and in ring_padding_ for silence padding).
@@ -109,6 +116,10 @@ class USBAudioSpeaker : public speaker::Speaker,
   std::atomic<uint8_t> writes_in_flight_{0};
   // Set by loop() while it pads a tail; play_internal_() waits instead of writing after the padding.
   std::atomic<bool> flushing_{false};
+  LevelMeter level_meter_;
+  // Scratch space for converting the caller's sample width to the USB stream's; set in setup().
+  uint8_t *convert_buffer_{nullptr};
+  size_t convert_buffer_size_{0};
   // Set while play() rejects audio in a format other than usb_stream_info_, so the error is logged once.
   std::atomic<bool> format_mismatch_{false};
   bool finishing_{false};

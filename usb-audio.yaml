@@ -1,0 +1,193 @@
+# USB audio on the AUX-2's USB host port, shared by both test builds. Include with
+#   !include { file: usb-audio.yaml, vars: { driver: uac2 } }   (or uac1)
+#
+# Output: a third choice, "USB", on the Audio Output selector, next to Analog (PCM5122 DAC) and Digital (TOSLink).
+#   The router feeds whichever is selected; the USB speaker converts the router's 24-bit audio to the 16-bit stream
+#   the USB device runs.
+# Input: the USB device's capture interface (e.g. a headset mic or line in through a TRRS splitter) as a Sendspin
+#   source, 48 kHz / 16-bit / mono.
+# Sensors: connection, status line, playing/signal, and RMS/peak levels for both directions. They work with any USB
+#   audio device, since levels are computed from the PCM the AUX-2 sends and receives.
+
+external_components:
+  # usb_audio with the `driver: uac1 | uac2` option, format conversion and level meters
+  # (overrides ESPHome's built-in usb_audio).
+  - source: github://googanhiem/aux-2-usb-audio-uac2@main
+    components: [usb_audio]
+    refresh: 0s
+
+usb_audio:
+  id: usb_audio_hub
+  driver: ${driver}
+
+speaker:
+  # Replaces the core package's router (removed in trim.yaml) with one that also has the USB output.
+  - platform: router
+    id: audio_router_speaker
+    output_speakers:
+      - i2s_audio_dac_speaker     # first = default on boot
+      - i2s_audio_spdif_speaker
+      - usb_audio_speaker
+    bits_per_sample: 24
+    num_channels: 2
+    sample_rate: 48000
+
+  - platform: usb_audio
+    id: usb_audio_speaker
+    usb_audio_id: usb_audio_hub
+    sample_rate: 48000
+    bits_per_sample: 16bit   # what the USB device streams; 24-bit input from the router is converted
+    num_channels: 2
+    buffer_size: 19200       # 100 ms at 48 kHz / 16-bit / stereo
+    write_timeout: 50ms
+
+microphone:
+  - platform: usb_audio
+    id: usb_audio_mic
+    usb_audio_id: usb_audio_hub
+    sample_rate: 48000
+    bits_per_sample: 16bit
+    num_channels: 1
+
+sendspin:
+  # Lets a Sendspin server (e.g. Music Assistant) take the USB input as a source.
+  source:
+    microphone:
+      microphone: usb_audio_mic
+      bits_per_sample: 16
+
+select:
+  # Replaces the core package's selector (removed in trim.yaml); the jack-detect automation still picks
+  # Analog or Digital when it is on.
+  - platform: template
+    id: audio_output_selector
+    name: Audio Output
+    entity_category: config
+    optimistic: true
+    restore_value: true
+    options:
+      - "Analog"
+      - "Digital"
+      - "USB"
+    on_value:
+      - router.speaker.switch_output:
+          id: audio_router_speaker
+          target_speaker: !lambda |-
+            if (x == "USB") {
+              return id(usb_audio_speaker);
+            }
+            if (x == "Digital") {
+              return id(i2s_audio_spdif_speaker);
+            }
+            return id(i2s_audio_dac_speaker);
+
+switch:
+  # Keeps the USB input running, so its level sensors work without a Sendspin server listening.
+  - platform: template
+    id: usb_input_monitor_switch
+    name: USB Audio Input Monitor
+    icon: mdi:microphone-settings
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_ON
+    entity_category: config
+    turn_on_action:
+      - microphone.capture: usb_audio_mic
+    turn_off_action:
+      - microphone.stop_capture: usb_audio_mic
+
+binary_sensor:
+  - platform: template
+    id: usb_output_connected
+    name: USB Audio Output Connected
+    device_class: connectivity
+    entity_category: diagnostic
+    lambda: 'return id(usb_audio_hub).is_connected(usb_audio::Endpoint::SPEAKER);'
+  - platform: template
+    id: usb_output_playing
+    name: USB Audio Output Playing
+    device_class: running
+    lambda: 'return id(usb_audio_speaker).is_running();'
+  - platform: template
+    id: usb_input_connected
+    name: USB Audio Input Connected
+    device_class: connectivity
+    entity_category: diagnostic
+    lambda: 'return id(usb_audio_hub).is_connected(usb_audio::Endpoint::MICROPHONE);'
+  - platform: template
+    id: usb_input_signal
+    name: USB Audio Input Signal
+    device_class: sound
+    # Above -60 dBFS RMS counts as signal; held for 2 s so speech pauses don't flap it.
+    lambda: |-
+      const float level = id(usb_input_level).state;
+      return !std::isnan(level) && level > -60.0f;
+    filters:
+      - delayed_off: 2s
+
+sensor:
+  # The level sensor reads (and resets) the meter once a second and publishes the peak alongside it.
+  - platform: template
+    id: usb_output_level
+    name: USB Audio Output Level
+    icon: mdi:volume-high
+    unit_of_measurement: dBFS
+    accuracy_decimals: 1
+    state_class: measurement
+    update_interval: 1s
+    lambda: |-
+      float rms, peak;
+      if (!id(usb_audio_speaker).take_level(rms, peak)) {
+        id(usb_output_peak).publish_state(NAN);
+        return NAN;
+      }
+      id(usb_output_peak).publish_state(peak);
+      return rms;
+  - platform: template
+    id: usb_output_peak
+    name: USB Audio Output Peak
+    icon: mdi:volume-vibrate
+    unit_of_measurement: dBFS
+    accuracy_decimals: 1
+    state_class: measurement
+    update_interval: never
+  - platform: template
+    id: usb_input_level
+    name: USB Audio Input Level
+    icon: mdi:microphone
+    unit_of_measurement: dBFS
+    accuracy_decimals: 1
+    state_class: measurement
+    update_interval: 1s
+    lambda: |-
+      float rms, peak;
+      if (!id(usb_audio_mic).take_level(rms, peak)) {
+        id(usb_input_peak).publish_state(NAN);
+        return NAN;
+      }
+      id(usb_input_peak).publish_state(peak);
+      return rms;
+  - platform: template
+    id: usb_input_peak
+    name: USB Audio Input Peak
+    icon: mdi:microphone-plus
+    unit_of_measurement: dBFS
+    accuracy_decimals: 1
+    state_class: measurement
+    update_interval: never
+
+text_sensor:
+  # Device name and stream format, or why it could not start (e.g. endpoints too small at full speed).
+  - platform: template
+    id: usb_output_status
+    name: USB Audio Output Status
+    icon: mdi:usb
+    entity_category: diagnostic
+    update_interval: 5s
+    lambda: 'return id(usb_audio_hub).get_status(usb_audio::Endpoint::SPEAKER);'
+  - platform: template
+    id: usb_input_status
+    name: USB Audio Input Status
+    icon: mdi:usb
+    entity_category: diagnostic
+    update_interval: 5s
+    lambda: 'return id(usb_audio_hub).get_status(usb_audio::Endpoint::MICROPHONE);'

@@ -6,6 +6,7 @@
 
 #include <array>
 #include <atomic>
+#include <string>
 
 #include "esphome/components/audio/audio.h"
 #include "esphome/core/component.h"
@@ -108,6 +109,12 @@ class USBAudioComponent : public Component {
   /// Start streaming as soon as the device is connected; the platform hears back through on_stream_state().
   void resume(Endpoint endpoint);
   void suspend(Endpoint endpoint);
+
+  /// A device interface for the endpoint is open (the device is plugged in and was accepted).
+  bool is_connected(Endpoint endpoint) const { return this->endpoint_(endpoint).handle.load() != nullptr; }
+  /// One line about the endpoint's device and stream, for a text sensor: the device name, the format it streams, or
+  /// why it could not start. Safe from any task.
+  std::string get_status(Endpoint endpoint);
 
   /// Safe from any task; the worker sends the values to the device.
   void set_speaker_volume_level(float volume);
@@ -239,6 +246,17 @@ class USBAudioComponent : public Component {
   static void driver_event_stub(uint8_t addr, uint8_t iface_num, uac_host_driver_event_t event, void *user_data);
   static void device_event_stub(DeviceHandle handle, uac_host_device_event_t event, void *user_data);
 #endif
+
+  /// Worker and main loop: replace the endpoint's status line.
+  void set_status_(Endpoint endpoint, const char *format, ...) __attribute__((format(printf, 3, 4)));
+  /// Worker: the device's product name for status lines ("USB audio" when unknown).
+  void read_product_name_(DeviceHandle handle);
+
+  static constexpr size_t STATUS_LENGTH = 112;
+  portMUX_TYPE status_lock_ = portMUX_INITIALIZER_UNLOCKED;
+  std::array<std::array<char, STATUS_LENGTH>, 2> status_{};
+  // Worker only.
+  char product_[48]{"USB audio"};
 
   StaticTask worker_;
   // Filled from the USB driver task and the worker, drained on the main loop.

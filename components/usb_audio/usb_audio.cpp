@@ -5,6 +5,8 @@
 #include <algorithm>
 #include <cinttypes>
 #include <cmath>
+#include <cstdarg>
+#include <cstdio>
 
 #include "esphome/core/application.h"
 #include "esphome/core/hal.h"
@@ -56,7 +58,42 @@ static bool alt_supports_rate(const uac_host_dev_alt_param_t &alt, uint32_t samp
 }
 #endif
 
+void USBAudioComponent::set_status_(Endpoint endpoint, const char *format, ...) {
+  char line[STATUS_LENGTH];
+  va_list args;
+  va_start(args, format);
+  vsnprintf(line, sizeof(line), format, args);
+  va_end(args);
+  portENTER_CRITICAL(&this->status_lock_);
+  std::copy(std::begin(line), std::end(line), this->status_[static_cast<size_t>(endpoint)].begin());
+  portEXIT_CRITICAL(&this->status_lock_);
+}
+
+std::string USBAudioComponent::get_status(Endpoint endpoint) {
+  std::array<char, STATUS_LENGTH> line;
+  portENTER_CRITICAL(&this->status_lock_);
+  line = this->status_[static_cast<size_t>(endpoint)];
+  portEXIT_CRITICAL(&this->status_lock_);
+  line.back() = '\0';
+  return std::string(line.data());
+}
+
+void USBAudioComponent::read_product_name_(DeviceHandle handle) {
+#ifdef USE_USB_AUDIO_UAC2
+  // Large (descriptor topology and strings), and the worker is the only caller.
+  static uac2_device_info_t info;
+  info = {};
+  if (uac2_host_device_get_info(handle, &info) == ESP_OK && info.product[0] != '\0') {
+    snprintf(this->product_, sizeof(this->product_), "%.47s", info.product);
+    return;
+  }
+#endif
+  snprintf(this->product_, sizeof(this->product_), "USB audio");
+}
+
 void USBAudioComponent::setup() {
+  this->set_status_(Endpoint::SPEAKER, "No device");
+  this->set_status_(Endpoint::MICROPHONE, "No device");
   this->event_queue_ = xQueueCreateStatic(EVENT_QUEUE_LENGTH, sizeof(USBAudioEvent), this->event_queue_storage_.data(),
                                           &this->event_queue_struct_);
   this->op_queue_ =
@@ -628,6 +665,7 @@ void USBAudioComponent::on_closed_(const USBAudioEvent &event, uint32_t now) {
   }
   ep.close_attempts = 0;
   ep.closing = nullptr;
+  this->set_status_(event.endpoint, "No device");
   ep.stream_started = false;
   ep.start_rejected = false;
   ep.start_pending = false;
@@ -718,13 +756,15 @@ void USBAudioComponent::run_op_(const Op &op) {
 #endif
       if (err != ESP_OK) {
         ESP_LOGE(TAG, "Failed to open %s interface: %s", LOG_STR_ARG(name), esp_err_to_name(err));
-      }
+        this->set_status_(op.endpoint, "Device found, open failed (%s)", esp_err_to_name(err));
+      } else {
+        this->read_product_name_(handle);
+        this->set_status_(op.endpoint, "%s: connected", this->product_);
 #ifdef USE_USB_AUDIO_UAC2
-      else {
         // Topology, clock, feature unit and alternate settings, for bring-up of new devices.
         uac2_host_device_print_info(handle);
-      }
 #endif
+      }
       result.type = USBAudioEvent::Type::OPENED;
       result.ok = err == ESP_OK;
       result.handle = handle;
@@ -753,7 +793,13 @@ void USBAudioComponent::run_op_(const Op &op) {
         result.rejected = err == ESP_ERR_NOT_SUPPORTED;
         if (!result.ok) {
           ESP_LOGW(TAG, "Failed to start %s stream: %s", LOG_STR_ARG(name), esp_err_to_name(err));
+          this->set_status_(op.endpoint, "%s: start failed (%s)", this->product_, esp_err_to_name(err));
+        } else {
+          this->set_status_(op.endpoint, "%s: %" PRIu32 " Hz, %u-bit, %u ch", this->product_, stm_cfg.sample_freq,
+                            stm_cfg.bit_resolution, stm_cfg.channels);
         }
+      } else if (result.rejected) {
+        this->set_status_(op.endpoint, "%s: format not supported (see log)", this->product_);
       }
 #endif
       this->post_event_(result);
@@ -867,9 +913,35 @@ esp_err_t USBAudioComponent::start_uac2_(Endpoint endpoint, DeviceHandle handle,
     ESP_LOGW(TAG, "%s does not support requested format (channels=%u bits=%u sample_rate=%" PRIu32 " Hz)",
              LOG_STR_ARG(name), channels, bits, sample_rate);
     this->log_uac2_alts_(endpoint, handle);
+    // A full-speed host sends one packet per 1 ms frame. Some high-speed devices keep their 125 us microframe packet
+    // sizes at full speed, so their endpoints are too small for the format (e.g. 64 bytes where 48 kHz stereo needs
+    // 192): say so, since it cannot be fixed on the host.
+    const uint32_t needed = (sample_rate + 999) / 1000 * channels * (bits / 8);
+    uint16_t largest = 0;
+    for (uint8_t alt = 1; alt < 16; alt++) {
+      uac2_host_dev_alt_param_t param{};
+      if (uac2_host_get_device_alt_param(handle, alt, &param) != ESP_OK) {
+        break;
+      }
+      if (param.channels == channels && param.bit_resolution == bits) {
+        largest = std::max(largest, param.ep_max_packet_size);
+      }
+    }
+    if (err == ESP_ERR_INVALID_SIZE && largest != 0 && largest < needed) {
+      ESP_LOGE(TAG,
+               "%s: %" PRIu32 " Hz %u-bit %u ch needs %" PRIu32 "-byte packets every 1 ms, but the device allows %u "
+               "bytes. It likely sizes its endpoints for high-speed USB only; the ESP32-S3 host is full-speed.",
+               this->product_, sample_rate, bits, channels, needed, largest);
+      this->set_status_(endpoint, "%s: endpoint too small at full speed (%u of %" PRIu32 " B)", this->product_,
+                        largest, needed);
+    } else {
+      this->set_status_(endpoint, "%s: %" PRIu32 " Hz %u-bit %u ch not supported (%s)", this->product_, sample_rate,
+                        bits, channels, esp_err_to_name(err));
+    }
     return err;
   }
   if (err != ESP_OK) {
+    this->set_status_(endpoint, "%s: start failed (%s)", this->product_, esp_err_to_name(err));
     return err;
   }
 
@@ -891,8 +963,12 @@ esp_err_t USBAudioComponent::start_uac2_(Endpoint endpoint, DeviceHandle handle,
              LOG_STR_ARG(name), stream.alt_setting, stream.bit_resolution, stream.sub_slot_size);
     uac2_host_device_stop(handle);
     rejected = true;
+    this->set_status_(endpoint, "%s: %u-bit in %u-byte slots not supported", this->product_, stream.bit_resolution,
+                      stream.sub_slot_size);
     return ESP_ERR_NOT_SUPPORTED;
   }
+  this->set_status_(endpoint, "%s: %" PRIu32 " Hz, %u-bit, %u ch (alt %u, %s)", this->product_, stream.sample_freq,
+                    stream.bit_resolution, stream.channels, stream.alt_setting, SYNC_NAMES[stream.sync_type & 3]);
   return ESP_OK;
 }
 

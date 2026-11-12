@@ -1,5 +1,8 @@
-# Home Assistant Connect AUX-2 test firmware: USB speaker on Espressif's UAC 1.0 driver (upstream usb_audio
+# Home Assistant Connect AUX-2 test firmware: USB audio on Espressif's UAC 1.0 driver (upstream usb_audio
 # behaviour). Regression build for UAC 1.0 devices such as the Sound BlasterX G6 (041e:3256).
+#
+# Same features as the UAC2 build (usb-audio.yaml): Audio Output selector with USB, USB input as a Sendspin
+# source, connection/status/level sensors.
 #
 # Uses this repo's patched espressif/usb_host_uac 1.5.0, which fixes the crash in uac_host_device_open()'s
 # error path when a device is rejected (e.g. a UAC 2.0 device plugged into a UAC1 build).
@@ -8,13 +11,11 @@
 
 packages:
   core: github://NabuCasa/aux-2/packages/aux-2.yaml@d30ca0b96561a18c3d3ffb6d25ae17b77208c957
-  # No Bluetooth, no ZWA-2 / ZBT-2 / USB RS-485 (Modbus): the USB host port is for the speaker only.
   trim: !include trim.yaml
-
-external_components:
-  - source: github://googanhiem/aux-2-usb-audio-uac2@main
-    components: [usb_audio]
-    refresh: 0s
+  usb_audio: !include
+    file: usb-audio.yaml
+    vars:
+      driver: uac1
 
 esp32:
   framework:
@@ -23,23 +24,6 @@ esp32:
         source: https://github.com/googanhiem/aux-2-usb-audio-uac2.git
         ref: main
         path: idf_components/usb_host_uac
-
-usb_audio:
-  id: usb_audio_hub
-  driver: uac1
-
-speaker:
-  - id: !extend mixing_speaker
-    output_speaker: usb_audio_speaker
-
-  - platform: usb_audio
-    id: usb_audio_speaker
-    usb_audio_id: usb_audio_hub
-    sample_rate: 48000
-    bits_per_sample: 16bit
-    num_channels: 2
-    buffer_size: 19200
-    write_timeout: 50ms
 
 # No BLE Improv (no Bluetooth); provision over USB serial (Improv) or the AP.
 improv_serial:
