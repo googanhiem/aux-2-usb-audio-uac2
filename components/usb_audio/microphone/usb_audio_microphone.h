@@ -23,10 +23,16 @@ class USBAudioMicrophone : public microphone::Microphone,
                            public Parented<USBAudioComponent>,
                            public USBAudioStream {
  public:
-  USBAudioMicrophone(const audio::AudioStreamInfo &stream_info, uint32_t buffer_size, std::span<uint8_t> frame)
-      : USBAudioStream(buffer_size), frame_(frame) {
+  /// stream_info is what the microphone publishes; usb_stream_info what the USB device captures. They differ only in
+  /// channels, when a mono capture is copied to both channels of a stereo stream (usb_num_channels: 1).
+  USBAudioMicrophone(const audio::AudioStreamInfo &stream_info, const audio::AudioStreamInfo &usb_stream_info,
+                     uint32_t buffer_size, std::span<uint8_t> frame)
+      : USBAudioStream(buffer_size), usb_stream_info_(usb_stream_info), frame_(frame) {
     this->audio_stream_info_ = stream_info;
   }
+
+  /// Holds one read's worth of upmixed audio; set by codegen only when the USB stream has fewer channels.
+  void set_upmix_buffer(std::span<uint8_t> buffer) { this->upmix_ = buffer; }
 
   void setup() override;
   void dump_config() override;
@@ -36,7 +42,7 @@ class USBAudioMicrophone : public microphone::Microphone,
   void start() override;
   void stop() override;
 
-  audio::AudioStreamInfo get_usb_stream_info() override { return this->audio_stream_info_; }
+  audio::AudioStreamInfo get_usb_stream_info() override { return this->usb_stream_info_; }
   void on_stream_state(StreamEvent event) override;
 
   /// RMS and peak (dBFS) of the audio captured since the last call; false when nothing was captured.
@@ -63,7 +69,12 @@ class USBAudioMicrophone : public microphone::Microphone,
   void request_(uint8_t set, uint8_t clear);
 
   // Sized by codegen from READ_PERIOD_MS in microphone/__init__.py.
+  /// Copy each USB frame's channels into the published layout; returns the upmixed bytes.
+  size_t upmix_frames_(size_t usb_bytes);
+
+  const audio::AudioStreamInfo usb_stream_info_;
   std::span<uint8_t> frame_;
+  std::span<uint8_t> upmix_;
   LevelMeter level_meter_;
   // Created once in setup() and parked between streams.
   StaticTask mic_task_;

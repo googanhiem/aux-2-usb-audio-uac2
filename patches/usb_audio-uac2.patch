@@ -1376,6 +1376,108 @@
    // The driver still holds a whole transfer to take, or one it took has not finished playing. Less than a transfer
    // stays in the ring buffer until the next write.
    return this->state_ == speaker::STATE_RUNNING &&
+--- a/esphome/components/usb_audio/microphone/__init__.py
++++ b/esphome/components/usb_audio/microphone/__init__.py
+@@ -1,7 +1,7 @@
+ import esphome.codegen as cg
+ from esphome.components import microphone
+ import esphome.config_validation as cv
+-from esphome.const import CONF_BUFFER_SIZE, CONF_ID, CONF_SAMPLE_RATE
++from esphome.const import CONF_BUFFER_SIZE, CONF_ID, CONF_NUM_CHANNELS, CONF_SAMPLE_RATE
+ from esphome.types import ConfigType
+ 
+ from .. import (
+@@ -23,14 +23,43 @@
+ # Keep in sync with USBAudioMicrophone::READ_TIMEOUT_MS in usb_audio_microphone.h
+ READ_PERIOD_MS = 20
+ 
++# Channels the USB device captures, when fewer than num_channels (the channels the microphone publishes): a mono
++# capture is copied to both channels of a stereo stream.
++CONF_USB_NUM_CHANNELS = "usb_num_channels"
+ 
++
++def _usb_config(config: ConfigType) -> ConfigType:
++    """The platform config as the USB stream sees it: usb_num_channels in place of num_channels."""
++    return {
++        **config,
++        CONF_NUM_CHANNELS: config.get(CONF_USB_NUM_CHANNELS, config[CONF_NUM_CHANNELS]),
++    }
++
++
+ def _read_size(config: ConfigType) -> int:
+-    """Bytes of audio in two read periods."""
+-    return (
+-        config[CONF_SAMPLE_RATE] * bytes_per_frame(config) * 2 * READ_PERIOD_MS // 1000
+-    )
++    """Bytes of USB audio in two read periods."""
++    usb = _usb_config(config)
++    return usb[CONF_SAMPLE_RATE] * bytes_per_frame(usb) * 2 * READ_PERIOD_MS // 1000
+ 
+ 
++def _upmix_size(config: ConfigType) -> int:
++    """Bytes of published audio for one read, when the USB stream has fewer channels; 0 otherwise."""
++    usb_channels = config.get(CONF_USB_NUM_CHANNELS, config[CONF_NUM_CHANNELS])
++    if usb_channels == config[CONF_NUM_CHANNELS]:
++        return 0
++    return _read_size(config) // usb_channels * config[CONF_NUM_CHANNELS]
++
++
++def validate_usb_channels(config: ConfigType) -> ConfigType:
++    usb_channels = config.get(CONF_USB_NUM_CHANNELS)
++    if usb_channels is not None and usb_channels > config[CONF_NUM_CHANNELS]:
++        raise cv.Invalid(
++            f"{CONF_USB_NUM_CHANNELS} cannot be more than {CONF_NUM_CHANNELS}",
++            path=[CONF_USB_NUM_CHANNELS],
++        )
++    return config
++
++
+ def validate_buffer_size(config: ConfigType) -> ConfigType:
+     """The driver buffer must hold the audio that arrives between two reads, with room to spare."""
+     return apply_buffer_size(
+@@ -38,27 +67,41 @@
+     )
+ 
+ 
++def _request_fifo(config: ConfigType) -> ConfigType:
++    request_microphone_fifo(_usb_config(config))
++    return config
++
++
+ CONFIG_SCHEMA = cv.All(
+     microphone.MICROPHONE_SCHEMA.extend(stream_schema(16000, 1)).extend(
+         {
+             cv.GenerateID(): cv.declare_id(USBAudioMicrophone),
++            cv.Optional(CONF_USB_NUM_CHANNELS): cv.int_range(min=1, max=2),
+         }
+     ),
++    validate_usb_channels,
+     set_stream_limits,
+     validate_buffer_size,
+-    request_microphone_fifo,
++    _request_fifo,
+ )
+ 
+ FINAL_VALIDATE_SCHEMA = final_validate_one_per_hub("microphone")
+ 
+ 
+ async def to_code(config: ConfigType) -> None:
++    upmix_size = _upmix_size(config)
+     var = cg.new_Pvariable(
+         config[CONF_ID],
+         stream_info(config),
++        stream_info(_usb_config(config)),
+         config[CONF_BUFFER_SIZE],
+         cg.static_buffer(config[CONF_ID], cg.uint8, _read_size(config)),
+     )
++    if upmix_size:
++        upmix_id = cv.declare_id(cg.uint8)(f"{config[CONF_ID].id}_upmix")
++        cg.add(
++            var.set_upmix_buffer(cg.static_buffer(upmix_id, cg.uint8, upmix_size))
++        )
+     await cg.register_component(var, config)
+     await microphone.register_microphone(var, config)
+     hub = await cg.get_variable(config[CONF_USB_AUDIO_ID])
 --- a/esphome/components/usb_audio/microphone/usb_audio_microphone.h
 +++ b/esphome/components/usb_audio/microphone/usb_audio_microphone.h
 @@ -5,6 +5,7 @@
@@ -1386,9 +1488,32 @@
  
  #include "esphome/components/audio/audio.h"
  #include "esphome/components/microphone/microphone.h"
-@@ -37,6 +38,9 @@
+@@ -22,11 +23,17 @@
+                            public Parented<USBAudioComponent>,
+                            public USBAudioStream {
+  public:
+-  USBAudioMicrophone(const audio::AudioStreamInfo &stream_info, uint32_t buffer_size, std::span<uint8_t> frame)
+-      : USBAudioStream(buffer_size), frame_(frame) {
++  /// stream_info is what the microphone publishes; usb_stream_info what the USB device captures. They differ only in
++  /// channels, when a mono capture is copied to both channels of a stereo stream (usb_num_channels: 1).
++  USBAudioMicrophone(const audio::AudioStreamInfo &stream_info, const audio::AudioStreamInfo &usb_stream_info,
++                     uint32_t buffer_size, std::span<uint8_t> frame)
++      : USBAudioStream(buffer_size), usb_stream_info_(usb_stream_info), frame_(frame) {
+     this->audio_stream_info_ = stream_info;
+   }
  
-   audio::AudioStreamInfo get_usb_stream_info() override { return this->audio_stream_info_; }
++  /// Holds one read's worth of upmixed audio; set by codegen only when the USB stream has fewer channels.
++  void set_upmix_buffer(std::span<uint8_t> buffer) { this->upmix_ = buffer; }
++
+   void setup() override;
+   void dump_config() override;
+   void loop() override;
+@@ -35,8 +42,11 @@
+   void start() override;
+   void stop() override;
+ 
+-  audio::AudioStreamInfo get_usb_stream_info() override { return this->audio_stream_info_; }
++  audio::AudioStreamInfo get_usb_stream_info() override { return this->usb_stream_info_; }
    void on_stream_state(StreamEvent event) override;
 +
 +  /// RMS and peak (dBFS) of the audio captured since the last call; false when nothing was captured.
@@ -1396,21 +1521,72 @@
    bool stream_idle() const override { return this->task_idle_; }
  
   protected:
-@@ -60,6 +64,7 @@
+@@ -59,7 +69,13 @@
+   void request_(uint8_t set, uint8_t clear);
  
    // Sized by codegen from READ_PERIOD_MS in microphone/__init__.py.
++  /// Copy each USB frame's channels into the published layout; returns the upmixed bytes.
++  size_t upmix_frames_(size_t usb_bytes);
++
++  const audio::AudioStreamInfo usb_stream_info_;
    std::span<uint8_t> frame_;
++  std::span<uint8_t> upmix_;
 +  LevelMeter level_meter_;
    // Created once in setup() and parked between streams.
    StaticTask mic_task_;
    std::atomic<uint8_t> commands_{0};
 --- a/esphome/components/usb_audio/microphone/usb_audio_microphone.cpp
 +++ b/esphome/components/usb_audio/microphone/usb_audio_microphone.cpp
-@@ -158,6 +158,7 @@
+@@ -30,10 +30,10 @@
+                 "USB Microphone:\n"
+                 "  Sample rate: %" PRIu32 " Hz\n"
+                 "  Bits per sample: %u\n"
+-                "  Channels: %u\n"
++                "  Channels: %u (USB device: %u)\n"
+                 "  Buffer size: %" PRIu32,
+                 this->audio_stream_info_.get_sample_rate(), this->audio_stream_info_.get_bits_per_sample(),
+-                this->audio_stream_info_.get_channels(), this->buffer_size_);
++                this->audio_stream_info_.get_channels(), this->usb_stream_info_.get_channels(), this->buffer_size_);
+ }
+ 
+ void USBAudioMicrophone::loop() {
+@@ -143,6 +143,25 @@
+   }
+ }
+ 
++size_t USBAudioMicrophone::upmix_frames_(size_t usb_bytes) {
++  const size_t sample_bytes = this->usb_stream_info_.get_bits_per_sample() / 8;
++  const size_t in_channels = this->usb_stream_info_.get_channels();
++  const size_t out_channels = this->audio_stream_info_.get_channels();
++  const size_t in_frame = sample_bytes * in_channels;
++  const size_t out_frame = sample_bytes * out_channels;
++  const size_t frames = std::min(usb_bytes / in_frame, this->upmix_.size() / out_frame);
++  for (size_t f = 0; f < frames; f++) {
++    const uint8_t *src = this->frame_.data() + f * in_frame;
++    uint8_t *dst = this->upmix_.data() + f * out_frame;
++    for (size_t ch = 0; ch < out_channels; ch++) {
++      // Extra output channels repeat the last USB channel (mono goes to both left and right).
++      const size_t from = std::min(ch, in_channels - 1);
++      std::copy_n(src + from * sample_bytes, sample_bytes, dst + ch * sample_bytes);
++    }
++  }
++  return frames * out_frame;
++}
++
+ void USBAudioMicrophone::mic_task(void *param) { static_cast<USBAudioMicrophone *>(param)->mic_task_loop_(); }
+ 
+ void USBAudioMicrophone::mic_task_loop_() {
+@@ -158,7 +177,12 @@
        }
  
        if (err == ESP_OK && bytes_read > 0) {
-+        this->level_meter_.add(this->frame_.data(), bytes_read, this->audio_stream_info_.get_bits_per_sample() / 8);
-         this->publish_audio_(this->frame_.first(bytes_read), this->audio_stream_info_);
+-        this->publish_audio_(this->frame_.first(bytes_read), this->audio_stream_info_);
++        this->level_meter_.add(this->frame_.data(), bytes_read, this->usb_stream_info_.get_bits_per_sample() / 8);
++        if (this->upmix_.empty()) {
++          this->publish_audio_(this->frame_.first(bytes_read), this->audio_stream_info_);
++        } else {
++          this->publish_audio_(this->upmix_.first(this->upmix_frames_(bytes_read)), this->audio_stream_info_);
++        }
        } else if (err == ESP_ERR_TIMEOUT) {
          // The driver already waited READ_TIMEOUT_MS for data; read again.
+       } else if (err == ESP_ERR_INVALID_STATE) {

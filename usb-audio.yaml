@@ -5,7 +5,8 @@
 #   The router feeds whichever is selected; the USB speaker converts the router's 24-bit audio to the 16-bit stream
 #   the USB device runs.
 # Input: the USB device's capture interface (e.g. a headset mic or line in through a TRRS splitter) as a Sendspin
-#   source, 48 kHz / 16-bit / mono.
+#   source, 48 kHz / 16-bit / stereo. The device captures mono (the Apple adapter's jack has one mic contact); the
+#   microphone copies it to both channels.
 # Sensors: connection, status line, playing/signal, and RMS/peak levels for both directions. They work with any USB
 #   audio device, since levels are computed from the PCM the AUX-2 sends and receives.
 
@@ -47,7 +48,8 @@ microphone:
     usb_audio_id: usb_audio_hub
     sample_rate: 48000
     bits_per_sample: 16bit
-    num_channels: 1
+    num_channels: 2       # published to Sendspin as stereo
+    usb_num_channels: 1   # captured from the device as mono, copied to left and right
 
 sendspin:
   # Lets a Sendspin server (e.g. Music Assistant) take the USB input as a source.
@@ -55,6 +57,7 @@ sendspin:
     microphone:
       microphone: usb_audio_mic
       bits_per_sample: 16
+      channels: [0, 1]
 
 select:
   # Replaces the core package's selector (removed in trim.yaml); the jack-detect automation still picks

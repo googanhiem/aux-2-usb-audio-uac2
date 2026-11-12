@@ -31,7 +31,9 @@ The **Audio Output** selector has three options: **Analog** (PCM5122 DAC), **Dig
 
 ### USB input as a Sendspin source
 
-The USB device's capture interface is the AUX-2's Sendspin **source**. That can be a headset mic or line in through a TRRS splitter on the Apple adapter. It streams at 48 kHz, 16-bit, mono, so a Sendspin server such as Music Assistant can use it as an input.
+The USB device's capture interface is the AUX-2's Sendspin **source**. That can be a headset mic or line in through a TRRS splitter on the Apple adapter. Sendspin gets 48 kHz, 16-bit **stereo**, so a server such as Music Assistant can use it as an input.
+
+The device itself captures mono (the Apple adapter's jack has a single mic contact), and the USB microphone copies that channel to left and right (`usb_num_channels: 1` with `num_channels: 2`). The input is mic-level with bias power on the mic line: a line-level source probably needs an attenuator.
 
 The UAC2 build enables duplex in the driver (`CONFIG_UAC2_ALLOW_DUPLEX`). `usb_host` splits the USB FIFO between playback and capture.
 

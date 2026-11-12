@@ -30,10 +30,10 @@ void USBAudioMicrophone::dump_config() {
                 "USB Microphone:\n"
                 "  Sample rate: %" PRIu32 " Hz\n"
                 "  Bits per sample: %u\n"
-                "  Channels: %u\n"
+                "  Channels: %u (USB device: %u)\n"
                 "  Buffer size: %" PRIu32,
                 this->audio_stream_info_.get_sample_rate(), this->audio_stream_info_.get_bits_per_sample(),
-                this->audio_stream_info_.get_channels(), this->buffer_size_);
+                this->audio_stream_info_.get_channels(), this->usb_stream_info_.get_channels(), this->buffer_size_);
 }
 
 void USBAudioMicrophone::loop() {
@@ -143,6 +143,25 @@ void USBAudioMicrophone::on_stream_state(StreamEvent event) {
   }
 }
 
+size_t USBAudioMicrophone::upmix_frames_(size_t usb_bytes) {
+  const size_t sample_bytes = this->usb_stream_info_.get_bits_per_sample() / 8;
+  const size_t in_channels = this->usb_stream_info_.get_channels();
+  const size_t out_channels = this->audio_stream_info_.get_channels();
+  const size_t in_frame = sample_bytes * in_channels;
+  const size_t out_frame = sample_bytes * out_channels;
+  const size_t frames = std::min(usb_bytes / in_frame, this->upmix_.size() / out_frame);
+  for (size_t f = 0; f < frames; f++) {
+    const uint8_t *src = this->frame_.data() + f * in_frame;
+    uint8_t *dst = this->upmix_.data() + f * out_frame;
+    for (size_t ch = 0; ch < out_channels; ch++) {
+      // Extra output channels repeat the last USB channel (mono goes to both left and right).
+      const size_t from = std::min(ch, in_channels - 1);
+      std::copy_n(src + from * sample_bytes, sample_bytes, dst + ch * sample_bytes);
+    }
+  }
+  return frames * out_frame;
+}
+
 void USBAudioMicrophone::mic_task(void *param) { static_cast<USBAudioMicrophone *>(param)->mic_task_loop_(); }
 
 void USBAudioMicrophone::mic_task_loop_() {
@@ -158,8 +177,12 @@ void USBAudioMicrophone::mic_task_loop_() {
       }
 
       if (err == ESP_OK && bytes_read > 0) {
-        this->level_meter_.add(this->frame_.data(), bytes_read, this->audio_stream_info_.get_bits_per_sample() / 8);
-        this->publish_audio_(this->frame_.first(bytes_read), this->audio_stream_info_);
+        this->level_meter_.add(this->frame_.data(), bytes_read, this->usb_stream_info_.get_bits_per_sample() / 8);
+        if (this->upmix_.empty()) {
+          this->publish_audio_(this->frame_.first(bytes_read), this->audio_stream_info_);
+        } else {
+          this->publish_audio_(this->upmix_.first(this->upmix_frames_(bytes_read)), this->audio_stream_info_);
+        }
       } else if (err == ESP_ERR_TIMEOUT) {
         // The driver already waited READ_TIMEOUT_MS for data; read again.
       } else if (err == ESP_ERR_INVALID_STATE) {
