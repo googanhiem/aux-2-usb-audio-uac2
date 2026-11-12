@@ -1,0 +1,47 @@
+# Home Assistant Connect AUX-2 test firmware: USB speaker on a UAC 2.0 host driver.
+#
+# Mixer output -> USB Audio Class 2.0 device on the AUX-2's USB host port, 48 kHz / 16-bit / stereo.
+# Targets: Creative SXFI AMP (041e:6007), Apple USB-C to 3.5 mm adapter (05ac:110a).
+# UAC 1.0-only devices (e.g. Sound BlasterX G6) are ignored by this build; use aux-2-usb-audio-uac1.yaml.
+#
+# Needs ESPHome dev (2026.11.0-dev or later), see README.md.
+
+packages:
+  # Upstream AUX-2 core package, pinned to the commit this was put together against.
+  core: github://NabuCasa/aux-2/packages/aux-2.yaml@d30ca0b96561a18c3d3ffb6d25ae17b77208c957
+
+external_components:
+  # usb_audio with the `driver: uac2` option (overrides ESPHome's built-in usb_audio).
+  - source: github://googanhiem/aux-2-usb-audio-uac2@main
+    components: [usb_audio]
+    refresh: 0s
+
+usb_audio:
+  id: usb_audio_hub
+  driver: uac2   # averyy/usb_host_uac2 0.2.0 from the ESP component registry
+
+speaker:
+  # Send the mixer to the USB speaker instead of the DAC/TOSLink router.
+  - id: !extend mixing_speaker
+    output_speaker: usb_audio_speaker
+
+  - platform: usb_audio
+    id: usb_audio_speaker
+    usb_audio_id: usb_audio_hub
+    sample_rate: 48000
+    bits_per_sample: 16bit   # matches the mixer's 16-bit sources
+    num_channels: 2
+    buffer_size: 19200       # 100 ms at 48 kHz / 16-bit / stereo
+    write_timeout: 50ms
+
+# From packages/factory.yaml, minus signed OTA and the update channel (those need the
+# signing keys). The core package's plain esphome OTA stays enabled.
+esp32_improv:
+  id: esp32_improv_component
+  authorizer: none
+
+improv_serial:
+  id: improv_serial_component
+
+provisioning:
+  timeout: 15min
