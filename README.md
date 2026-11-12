@@ -16,7 +16,9 @@ ESPHome's `usb_audio` component (esphome/esphome#11728) is built on Espressif's 
 Both configs:
 - pull the upstream AUX-2 package (`NabuCasa/aux-2`, pinned commit);
 - point the mixer at the USB speaker (48 kHz, 16-bit, stereo);
-- add Improv (BLE and serial) and provisioning in place of the factory package, which needs signing keys.
+- keep everything else from the AUX-2 package, including Sendspin: the hub, the Sendspin media source and its switches, all on by default. Sendspin and media-player audio go through the mixer to the USB speaker. The 16-bit USB speaker makes the whole chain 16-bit;
+- remove Bluetooth (proxy, BLE stack, its switch, BLE Improv) and every USB device except the speaker (ZWA-2 Z-Wave proxy, ZBT-2 Zigbee proxy, CH343 USB RS-485/Modbus proxy) via `trim.yaml`. The onboard RS-232 proxies stay;
+- add Improv over USB serial and provisioning in place of the factory package, which needs signing keys.
 
 A UAC2 build ignores UAC 1.0 devices and a UAC1 build ignores UAC 2.0 devices.
 
@@ -57,6 +59,9 @@ The UAC2 build logs the device's descriptor dump when it opens the speaker. On s
 - `docs/UAC2-PROTOTYPE.md`: approach, API mapping, USB host channel budget, open questions.
 
 ## USB host channels
+
+With `trim.yaml` the USB host port is left to the speaker (and a hub, if you use one), so channels are not a constraint for these test builds. A UAC2 speaker uses at most 3 of the 8 channels, and a hub adds 2. The limit below applies to the stock AUX-2 firmware.
+
 
 The ESP32-S3 has 8 USB host channels, and every endpoint pipe in use holds one, including each device's EP0. A hub, a ZWA-2 and a CH343 already use all 8, so with those three attached no audio device can enumerate.
 

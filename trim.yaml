@@ -1,0 +1,27 @@
+# Strips the AUX-2 core package down for USB audio testing: no Bluetooth, and no USB devices other than
+# the USB speaker (ZWA-2 Z-Wave, ZBT-2 Zigbee, CH343 RS-485/Modbus). Leaves the USB host port to the
+# audio device alone. The onboard RS-232 serial proxies stay.
+
+##### Bluetooth (BLE stack, proxy, scanner, its switch, and the setup-wizard page that points at it)
+esp32_ble: !remove
+bluetooth_proxy: !remove
+esp32_ble_tracker: !remove
+
+switch:
+  - id: !remove bluetooth_switch
+
+api:
+  # The wizard's first page is the (removed) Bluetooth switch; drop the wizard for this test build.
+  wizard: !remove
+
+##### ZWA-2 (Z-Wave), ZBT-2 (Zigbee) and the CH343 USB RS-485 dongle (Modbus)
+usb_uart: !remove
+zwave_proxy: !remove
+
+mdns:
+  # Only advertised the Z-Wave proxy.
+  services: !remove
+
+serial_proxy:
+  - id: !remove usb_serial_proxy
+  - id: !remove zigbee_serial_proxy

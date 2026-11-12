@@ -8,6 +8,8 @@
 
 packages:
   core: github://NabuCasa/aux-2/packages/aux-2.yaml@d30ca0b96561a18c3d3ffb6d25ae17b77208c957
+  # No Bluetooth, no ZWA-2 / ZBT-2 / USB RS-485 (Modbus): the USB host port is for the speaker only.
+  trim: !include trim.yaml
 
 external_components:
   - source: github://googanhiem/aux-2-usb-audio-uac2@main
@@ -39,10 +41,7 @@ speaker:
     buffer_size: 19200
     write_timeout: 50ms
 
-esp32_improv:
-  id: esp32_improv_component
-  authorizer: none
-
+# No BLE Improv (no Bluetooth); provision over USB serial (Improv) or the AP.
 improv_serial:
   id: improv_serial_component
 

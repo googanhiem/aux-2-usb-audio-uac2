@@ -9,6 +9,8 @@
 packages:
   # Upstream AUX-2 core package, pinned to the commit this was put together against.
   core: github://NabuCasa/aux-2/packages/aux-2.yaml@d30ca0b96561a18c3d3ffb6d25ae17b77208c957
+  # No Bluetooth, no ZWA-2 / ZBT-2 / USB RS-485 (Modbus): the USB host port is for the speaker only.
+  trim: !include trim.yaml
 
 external_components:
   # usb_audio with the `driver: uac2` option (overrides ESPHome's built-in usb_audio).
@@ -35,11 +37,7 @@ speaker:
     write_timeout: 50ms
 
 # From packages/factory.yaml, minus signed OTA and the update channel (those need the
-# signing keys). The core package's plain esphome OTA stays enabled.
-esp32_improv:
-  id: esp32_improv_component
-  authorizer: none
-
+# signing keys) and BLE Improv (no Bluetooth). Provision over USB serial (Improv) or the AP.
 improv_serial:
   id: improv_serial_component
 
